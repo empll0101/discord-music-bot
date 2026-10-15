@@ -95,6 +95,7 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     const args = [
                         ...this.getJsRuntimeArgs(),
                         '--no-cache-dir',
+                        '--extractor-args', 'youtube:player_client=android,web,tv',
                         '-f', 'ba/b',
                         '--no-playlist',
                         '--no-warnings',
@@ -259,6 +260,7 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         const fullArgs = [
             ...this.getJsRuntimeArgs(),
             '--no-cache-dir',
+            '--extractor-args', 'youtube:player_client=android,web,tv',
             '--dump-single-json',
             '--flat-playlist',
             '--retries', '2',
