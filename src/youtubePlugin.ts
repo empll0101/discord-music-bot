@@ -92,9 +92,13 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     return;
                 }
 
+                let retriedWithoutCookies = false;
+                let retriedWithCookies = false;
+
                 const startDownload = (useCookies = Boolean(this.cookiesPath)) => {
                     const args = [
                         ...this.getJsRuntimeArgs(),
+                        '--remote-components', 'ejs:github',
                         '--no-cache-dir',
                         '--extractor-args', 'youtube:player_client=android,web,tv',
                         '-f', 'ba/b',
@@ -176,12 +180,14 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
                         if (code !== 0 && code !== null) {
                             console.error(`[YouTubePlugin] yt-dlp stream failed with code ${code}: ${stderrMsg.trim()}`);
-                            if (!headersSent && useCookies && this.cookiesPath) {
+                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies) {
+                                retriedWithoutCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream failed with cookies, retrying without cookies...');
                                 startDownload(false);
                                 return;
                             }
-                            if (!headersSent && !useCookies && this.cookiesPath) {
+                            if (!headersSent && !useCookies && this.cookiesPath && !retriedWithCookies) {
+                                retriedWithCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream failed without cookies, retrying with cookies...');
                                 startDownload(true);
                                 return;
@@ -260,6 +266,7 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
         const fullArgs = [
             ...this.getJsRuntimeArgs(),
+            '--remote-components', 'ejs:github',
             '--no-cache-dir',
             '--extractor-args', 'youtube:player_client=android,web,tv',
             '--dump-single-json',
