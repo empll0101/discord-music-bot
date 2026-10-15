@@ -82,6 +82,9 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     return;
                 }
 
+                let retriedWithoutCookies = false;
+                let retriedWithCookies = false;
+
                 const startDownload = (useCookies = Boolean(this.cookiesPath)) => {
                     const args = [
                         ...this.getDenoArgs(),
@@ -165,12 +168,14 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
                         if (code !== 0 && code !== null) {
                             console.error(`[YouTubePlugin] yt-dlp stream failed with code ${code}: ${stderrMsg.trim()}`);
-                            if (!headersSent && useCookies && this.cookiesPath) {
+                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies) {
+                                retriedWithoutCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream failed with cookies, retrying without cookies...');
                                 startDownload(false);
                                 return;
                             }
-                            if (!headersSent && !useCookies && this.cookiesPath && (stderrMsg.includes('Sign in') || stderrMsg.includes('confirm your age'))) {
+                            if (!headersSent && !useCookies && this.cookiesPath && !retriedWithCookies && (stderrMsg.includes('Sign in') || stderrMsg.includes('confirm your age'))) {
+                                retriedWithCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream requires cookies, retrying with cookies...');
                                 startDownload(true);
                                 return;
