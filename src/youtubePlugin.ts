@@ -9,10 +9,17 @@ const ExtractorPluginClass = distubeModule.ExtractorPlugin;
 const SongClass = distubeModule.Song;
 const PlaylistClass = distubeModule.Playlist;
 
+interface CacheEntry {
+    data: any;
+    expiry: number;
+}
+
 export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
     private port = 39281;
     private server: http.Server | null = null;
     private cookiesPath: string | null = null;
+    private metaCache = new Map<string, CacheEntry>();
+    private readonly CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
     constructor() {
         super();
@@ -28,6 +35,9 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         if (fs.existsSync(denoDir) && !process.env.PATH?.includes(denoDir)) {
             process.env.PATH = `${denoDir}${path.delimiter}${process.env.PATH}`;
         }
+        if (fs.existsSync('/usr/local/bin') && !process.env.PATH?.includes('/usr/local/bin')) {
+            process.env.PATH = `/usr/local/bin${path.delimiter}${process.env.PATH}`;
+        }
     }
 
     private findCookies() {
@@ -36,17 +46,21 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
             const filePath = path.join(process.cwd(), file);
             if (fs.existsSync(filePath)) {
                 this.cookiesPath = filePath;
-                console.log(`✅ [YouTubePlugin] Using cookies from ${file}`);
+                console.log(`✅ [YouTubePlugin] Found cookies at ${file}`);
                 break;
             }
         }
     }
 
-    private getDenoArgs(): string[] {
+    private getJsRuntimeArgs(): string[] {
         const homeDir = process.env.HOME || process.env.USERPROFILE || '';
         const winDeno = path.join(homeDir, '.deno', 'bin', 'deno.exe');
+        const winProgramFiles = 'C:\\Program Files\\Deno\\deno.exe';
         const linuxDeno = path.join(homeDir, '.deno', 'bin', 'deno');
 
+        if (fs.existsSync(winProgramFiles)) {
+            return ['--js-runtimes', `deno:${winProgramFiles}`];
+        }
         if (fs.existsSync(winDeno)) {
             return ['--js-runtimes', `deno:${winDeno}`];
         }
@@ -65,6 +79,8 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                 req.socket.setNoDelay(true);
                 const u = new URL(req.url || '/', `http://127.0.0.1:${this.port}`);
                 const query = u.searchParams.get('q');
+                const titleParam = u.searchParams.get('title');
+                const uploaderParam = u.searchParams.get('uploader');
                 if (!query) {
                     res.writeHead(400);
                     res.end('Missing query parameter');
@@ -84,17 +100,26 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
                 let retriedWithoutCookies = false;
                 let retriedWithCookies = false;
+                let fallbackAttempted = false;
+                let currentYtdlp: any = null;
 
-                const startDownload = (useCookies = Boolean(this.cookiesPath)) => {
+                req.on('close', () => {
+                    if (currentYtdlp && !currentYtdlp.killed) {
+                        currentYtdlp.kill();
+                    }
+                });
+
+                const startDownload = (targetUrl: string, useCookies = Boolean(this.cookiesPath)) => {
                     const args = [
-                        ...this.getDenoArgs(),
+                        ...this.getJsRuntimeArgs(),
                         '--remote-components', 'ejs:github',
+                        '--no-cache-dir',
                         '-f', 'ba/b',
                         '--no-playlist',
                         '--no-warnings',
                         '--quiet',
                         '--no-progress',
-                        '--buffer-size', '2048k',
+                        '--buffer-size', '1024k',
                         '--retries', '3',
                         '--fragment-retries', '3',
                         '--file-access-retries', '3',
@@ -107,11 +132,13 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     if (useCookies && this.cookiesPath) {
                         args.push('--cookies', this.cookiesPath);
                     }
-                    args.push(query);
+                    args.push(targetUrl);
 
+                    console.log(`[YouTubePlugin] Spawning yt-dlp stream for: ${targetUrl} (cookies: ${useCookies})`);
                     const ytdlp = spawn('yt-dlp', args, {
                         stdio: ['ignore', 'pipe', 'pipe']
                     });
+                    currentYtdlp = ytdlp;
                     
                     const chunks: Buffer[] = [];
                     let totalBytes = 0;
@@ -167,18 +194,59 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
                         if (code !== 0 && code !== null) {
                             console.error(`[YouTubePlugin] yt-dlp stream failed with code ${code}: ${stderrMsg.trim()}`);
-                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies) {
+                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies && !stderrMsg.includes('Video unavailable') && !stderrMsg.includes('This video is not available')) {
                                 retriedWithoutCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream failed with cookies, retrying without cookies...');
-                                startDownload(false);
+                                startDownload(targetUrl, false);
                                 return;
                             }
                             if (!headersSent && !useCookies && this.cookiesPath && !retriedWithCookies && (stderrMsg.includes('Sign in') || stderrMsg.includes('confirm your age'))) {
                                 retriedWithCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream requires cookies, retrying with cookies...');
-                                startDownload(true);
+                                startDownload(targetUrl, true);
                                 return;
                             }
+
+                            // If video is unavailable in stream (e.g. Topic track in a playlist on datacenter IP),
+                            // fallback to searching for the playable alternative song
+                            if (!headersSent && !fallbackAttempted && (stderrMsg.includes('Video unavailable') || stderrMsg.includes('This video is not available'))) {
+                                fallbackAttempted = true;
+                                console.warn(`⚠️ [YouTubePlugin StreamServer] Stream failed for ${targetUrl} due to availability. Attempting fallback...`);
+                                (async () => {
+                                    try {
+                                        let searchQuery = '';
+                                        if (titleParam) {
+                                            const cleanUploader = (uploaderParam || '').replace(/- Topic$/i, '').trim();
+                                            searchQuery = `${titleParam} ${cleanUploader}`.trim();
+                                        } else {
+                                            const info = await this.fetchOEmbed(targetUrl);
+                                            if (info && info.title) {
+                                                const cleanAuthor = info.author_name.replace(/- Topic$/i, '').trim();
+                                                searchQuery = `${info.title} ${cleanAuthor}`.trim();
+                                            }
+                                        }
+
+                                        if (searchQuery) {
+                                            console.log(`[YouTubePlugin StreamServer] 🔄 Fallback searching YouTube for: "${searchQuery}"`);
+                                            const targetId = this.extractVideoId(targetUrl);
+                                            const fallbackSong = await this.searchSong(searchQuery, {}, targetId);
+                                            const fallbackId = fallbackSong?.url ? this.extractVideoId(fallbackSong.url) : (fallbackSong?.id || '');
+                                            if (fallbackSong && fallbackSong.url && (!targetId || fallbackId !== targetId)) {
+                                                console.log(`✅ [YouTubePlugin StreamServer] Streaming fallback song instead: ${fallbackSong.name} (${fallbackSong.url})`);
+                                                startDownload(fallbackSong.url, Boolean(this.cookiesPath));
+                                                return;
+                                            }
+                                        }
+                                    } catch (fallbackErr) {
+                                        console.error('[YouTubePlugin StreamServer] Fallback search error:', fallbackErr);
+                                    }
+                                    if (!res.destroyed) {
+                                        res.destroy(new Error(`yt-dlp stream exited with code ${code}`));
+                                    }
+                                })();
+                                return;
+                            }
+
                             if (!res.destroyed) {
                                 res.destroy(new Error(`yt-dlp stream exited with code ${code}`));
                             }
@@ -196,15 +264,10 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                             res.end();
                         }
                     });
-
-                    req.on('close', () => {
-                        if (!ytdlp.killed) {
-                            ytdlp.kill();
-                        }
-                    });
                 };
 
-                startDownload();
+                // Start with cookies if available to satisfy bot check on datacenter IP
+                startDownload(query, Boolean(this.cookiesPath));
             } catch (e) {
                 console.error('[YouTubePlugin StreamServer] Request error:', e);
                 if (!res.headersSent) {
@@ -243,19 +306,31 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
     }
 
     private async runYtDlpJson(args: string[], useCookies = Boolean(this.cookiesPath)): Promise<any> {
+        // Cache lookup
+        const cacheKey = `${args.join(' ')}|cookies=${useCookies}`;
+        const cached = this.metaCache.get(cacheKey);
+        if (cached && cached.expiry > Date.now()) {
+            return cached.data;
+        }
+
         const fullArgs = [
-            ...this.getDenoArgs(),
+            ...this.getJsRuntimeArgs(),
             '--remote-components', 'ejs:github',
+            '--no-cache-dir',
             '--dump-single-json',
             '--flat-playlist',
-            '--retries', '3',
-            '--socket-timeout', '15',
+            '--retries', '2',
+            '--socket-timeout', '10',
             '-4'
         ];
+
         if (useCookies && this.cookiesPath) {
             fullArgs.push('--cookies', this.cookiesPath);
         }
         fullArgs.push(...args);
+
+        const startTime = Date.now();
+        console.log(`[YouTubePlugin] Resolving metadata for: ${args.join(' ')}`);
 
         const proc = spawn('yt-dlp', fullArgs, {
             stdio: ['ignore', 'pipe', 'pipe']
@@ -263,12 +338,13 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         let stdout = '';
         let stderr = '';
 
+        // Allow up to 45 seconds on cloud VM
         const timeout = setTimeout(() => {
             if (!proc.killed) {
-                console.warn('⚠️ [YouTubePlugin] yt-dlp process timed out after 35s, killing...');
+                console.warn('⚠️ [YouTubePlugin] yt-dlp process timed out after 45s, killing...');
                 proc.kill('SIGKILL');
             }
-        }, 35000);
+        }, 45000);
 
         proc.stdout.on('data', d => stdout += d.toString());
         proc.stderr.on('data', d => stderr += d.toString());
@@ -278,28 +354,37 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                 clearTimeout(timeout);
                 if (code === 0) {
                     try {
-                        resolve(JSON.parse(stdout));
+                        const parsed = JSON.parse(stdout);
+                        console.log(`[YouTubePlugin] ✅ Successfully resolved metadata in ${Date.now() - startTime}ms`);
+                        // Save in cache
+                        this.metaCache.set(cacheKey, {
+                            data: parsed,
+                            expiry: Date.now() + this.CACHE_TTL_MS
+                        });
+                        resolve(parsed);
                     } catch (e) {
                         reject(new Error(`Failed to parse yt-dlp JSON: ${e}`));
                     }
                 } else {
-                    if (useCookies && this.cookiesPath) {
-                        console.warn('⚠️ [YouTubePlugin] Query failed with cookies. Retrying without cookies...');
-                        try {
-                            const result = await this.runYtDlpJson(args, false);
-                            resolve(result);
-                            return;
-                        } catch {
-                            // fall through
-                        }
-                    } else if (!useCookies && this.cookiesPath && (stderr.includes('Sign in') || stderr.includes('confirm your age'))) {
-                        console.warn('⚠️ [YouTubePlugin] Query requires sign in. Retrying with cookies...');
+                    if (!useCookies && this.cookiesPath && (stderr.includes('Sign in') || stderr.includes('confirm your age') || stderr.includes('Private video'))) {
+                        console.warn('⚠️ [YouTubePlugin] Query without cookies failed, retrying with cookies...');
                         try {
                             const result = await this.runYtDlpJson(args, true);
                             resolve(result);
                             return;
-                        } catch {
-                            // fall through
+                        } catch (retryErr) {
+                            reject(retryErr);
+                            return;
+                        }
+                    } else if (useCookies && (stderr.includes('Sign in') || stderr.includes('The page needs to be reloaded'))) {
+                        console.warn('⚠️ [YouTubePlugin] Query with cookies failed, retrying without cookies...');
+                        try {
+                            const result = await this.runYtDlpJson(args, false);
+                            resolve(result);
+                            return;
+                        } catch (retryErr) {
+                            reject(retryErr);
+                            return;
                         }
                     }
                     reject(new Error(`yt-dlp failed with code ${code}: ${stderr}`));
@@ -311,6 +396,7 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
     private async fetchOEmbed(url: string): Promise<{ title: string; author_name: string } | null> {
         return new Promise((resolve) => {
             try {
+                // Ensure standard watch URL format for oEmbed
                 let targetUrl = url;
                 try {
                     const u = new URL(url);
@@ -351,12 +437,19 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         });
     }
 
+    extractVideoId(url: string): string {
+        const match = url.match(/(?:v=|\/|youtu\.be\/)([a-zA-Z0-9_-]{11})(?:[&?]|$)/);
+        return match ? match[1] : '';
+    }
+
     async resolve(url: string, options: any): Promise<any> {
         let data: any;
         try {
             data = await this.runYtDlpJson([url]);
         } catch (err: any) {
             const errStr = String(err?.message || err);
+            // Smart fallback: If YouTube blocks this specific video ID (common with DRM Music Topic tracks on datacenter IPs),
+            // fetch title via YouTube's public oEmbed API and search for a playable alternative.
             if (errStr.includes('Video unavailable') || errStr.includes('This video is not available') || errStr.includes('403')) {
                 console.warn(`⚠️ [YouTubePlugin] Direct resolve failed for ${url} (${errStr.split('\n')[0]}). Attempting oEmbed title fallback...`);
                 const info = await this.fetchOEmbed(url);
@@ -364,7 +457,8 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     const cleanAuthor = info.author_name.replace(/- Topic$/i, '').trim();
                     const searchQuery = `${info.title} ${cleanAuthor}`.trim();
                     console.log(`[YouTubePlugin] 🔄 Fallback searching YouTube for: "${searchQuery}"`);
-                    const fallbackSong = await this.searchSong(searchQuery, options);
+                    const targetId = this.extractVideoId(url);
+                    const fallbackSong = await this.searchSong(searchQuery, options, targetId);
                     if (fallbackSong) {
                         console.log(`✅ [YouTubePlugin] Fallback successfully found playable song: ${fallbackSong.name} (${fallbackSong.url})`);
                         return fallbackSong;
@@ -416,9 +510,11 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         }, options);
     }
 
-    async searchSong(query: string, options: any): Promise<any> {
-        const data = await this.runYtDlpJson([`ytsearch1:${query}`]);
-        const entry = data.entries ? data.entries[0] : data;
+    async searchSong(query: string, options: any, excludeId?: string): Promise<any> {
+        const count = excludeId ? 3 : 1;
+        const data = await this.runYtDlpJson([`ytsearch${count}:${query}`]);
+        const entries = data.entries ? data.entries : (data ? [data] : []);
+        const entry = entries.find((e: any) => !excludeId || e.id !== excludeId) || entries[0];
         if (!entry) return null;
 
         return new SongClass({
@@ -438,7 +534,6 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
     }
 
     async prefetch(song: any): Promise<void> {
-        // Direct stream URLs from googlevideo.com are rejected with HTTP 403 Forbidden by YouTube CDN.
         // Playback is safely and efficiently streamed on-demand via the local proxy.
     }
 
@@ -447,7 +542,14 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         if (!target) {
             throw new Error('Cannot get stream URL: Song has no valid URL or ID');
         }
-        return `http://127.0.0.1:${this.port}/stream?q=${encodeURIComponent(target)}`;
+        let streamUrl = `http://127.0.0.1:${this.port}/stream?q=${encodeURIComponent(target)}`;
+        if (song.name) {
+            streamUrl += `&title=${encodeURIComponent(song.name)}`;
+        }
+        if (song.uploader?.name) {
+            streamUrl += `&uploader=${encodeURIComponent(song.uploader.name)}`;
+        }
+        return streamUrl;
     }
 
     async getRelatedSongs(song: any): Promise<any[]> {
