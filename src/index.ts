@@ -58,7 +58,16 @@ export const distube = new DisTube(client, {
     emitAddListWhenCreatingQueue: false,
     plugins: [
         youtubePlugin as any,
-        new SpotifyPlugin() as any,
+        new SpotifyPlugin(
+            process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET
+                ? {
+                    api: {
+                        clientId: process.env.SPOTIFY_CLIENT_ID,
+                        clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+                    },
+                }
+                : undefined
+        ) as any,
         new SoundCloudPlugin() as any,
         new YtDlpPlugin({ update: true }) as any
     ]
