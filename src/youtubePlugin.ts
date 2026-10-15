@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import http from 'http';
+import https from 'https';
 import path from 'path';
 import fs from 'fs';
 
@@ -304,8 +305,71 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         });
     }
 
+    private async fetchOEmbed(url: string): Promise<{ title: string; author_name: string } | null> {
+        return new Promise((resolve) => {
+            try {
+                let targetUrl = url;
+                try {
+                    const u = new URL(url);
+                    const v = u.searchParams.get('v') || (u.hostname === 'youtu.be' ? u.pathname.slice(1) : null);
+                    if (v) {
+                        targetUrl = `https://www.youtube.com/watch?v=${v}`;
+                    }
+                } catch {}
+
+                const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(targetUrl)}&format=json`;
+                const req = https.get(oembedUrl, { timeout: 6000 }, (res) => {
+                    if (res.statusCode !== 200) {
+                        res.resume();
+                        return resolve(null);
+                    }
+                    let body = '';
+                    res.on('data', (c) => body += c);
+                    res.on('end', () => {
+                        try {
+                            const json = JSON.parse(body);
+                            resolve({
+                                title: json.title || '',
+                                author_name: json.author_name || ''
+                            });
+                        } catch {
+                            resolve(null);
+                        }
+                    });
+                });
+                req.on('error', () => resolve(null));
+                req.on('timeout', () => {
+                    req.destroy();
+                    resolve(null);
+                });
+            } catch {
+                resolve(null);
+            }
+        });
+    }
+
     async resolve(url: string, options: any): Promise<any> {
-        const data = await this.runYtDlpJson([url]);
+        let data: any;
+        try {
+            data = await this.runYtDlpJson([url]);
+        } catch (err: any) {
+            const errStr = String(err?.message || err);
+            if (errStr.includes('Video unavailable') || errStr.includes('This video is not available') || errStr.includes('403')) {
+                console.warn(`⚠️ [YouTubePlugin] Direct resolve failed for ${url} (${errStr.split('\n')[0]}). Attempting oEmbed title fallback...`);
+                const info = await this.fetchOEmbed(url);
+                if (info && info.title) {
+                    const cleanAuthor = info.author_name.replace(/- Topic$/i, '').trim();
+                    const searchQuery = `${info.title} ${cleanAuthor}`.trim();
+                    console.log(`[YouTubePlugin] 🔄 Fallback searching YouTube for: "${searchQuery}"`);
+                    const fallbackSong = await this.searchSong(searchQuery, options);
+                    if (fallbackSong) {
+                        console.log(`✅ [YouTubePlugin] Fallback successfully found playable song: ${fallbackSong.name} (${fallbackSong.url})`);
+                        return fallbackSong;
+                    }
+                }
+            }
+            throw err;
+        }
 
         if (data._type === 'playlist' || (data.entries && Array.isArray(data.entries))) {
             const songs = (data.entries || []).map((entry: any) => new SongClass({
