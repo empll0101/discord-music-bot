@@ -1,64 +1,26 @@
-import { ChatInputCommandInteraction, SlashCommandBuilder, GuildMember } from 'discord.js';
-import { distube } from './index';
+import { ChatInputCommandInteraction, GuildMember } from 'discord.js';
+import { distube, clearIdleTimer, resetIdleTimer, prefetchNextSong } from './index';
+import { commands } from './commandDefinitions';
 
-export const commands = [
-    new SlashCommandBuilder()
-        .setName('play')
-        .setDescription('Play a song from YouTube, Spotify, or SoundCloud')
-        .addStringOption(option => 
-            option.setName('query')
-                .setDescription('The song name or URL to play')
-                .setRequired(true)
-        ),
-    new SlashCommandBuilder()
-        .setName('skip')
-        .setDescription('Skip the current song'),
-    new SlashCommandBuilder()
-        .setName('pause')
-        .setDescription('Pause the current song'),
-    new SlashCommandBuilder()
-        .setName('resume')
-        .setDescription('Resume the current song'),
-    new SlashCommandBuilder()
-        .setName('stop')
-        .setDescription('Stop the player and disconnect'),
-    new SlashCommandBuilder()
-        .setName('queue')
-        .setDescription('Show the current music queue'),
-    new SlashCommandBuilder()
-        .setName('nowplay')
-        .setDescription('Show the currently playing song and progress'),
-    new SlashCommandBuilder()
-        .setName('volume')
-        .setDescription('Adjust the volume')
-        .addIntegerOption(option => 
-            option.setName('amount')
-                .setDescription('Volume amount (1-100)')
-                .setMinValue(1)
-                .setMaxValue(100)
-                .setRequired(true)
-        ),
-    new SlashCommandBuilder()
-        .setName('remove')
-        .setDescription('Remove a song from the queue by its number')
-        .addIntegerOption(option => 
-            option.setName('number')
-                .setDescription('The number of the song in the queue (e.g. 1 for the first Up Next)')
-                .setMinValue(1)
-                .setRequired(true)
-        )
-];
+export { commands };
 
 export async function executeCommand(interaction: ChatInputCommandInteraction) {
+    console.log(`[Interaction] Executing /${interaction.commandName} from ${interaction.user.tag}`);
+    try {
+        await interaction.deferReply();
+    } catch (e: any) {
+        console.error(`[Interaction] Failed to deferReply:`, e?.message || e);
+        return;
+    }
+
     const member = interaction.member as GuildMember;
-    const voiceChannel = member.voice.channel;
+    const voiceChannel = member?.voice?.channel;
 
     if (!voiceChannel) {
-        return interaction.reply({ content: 'You need to join a voice channel first!', ephemeral: true });
+        return interaction.followUp({ content: 'You need to join a voice channel first!' });
     }
 
     try {
-        await interaction.deferReply();
         if (interaction.commandName === 'play') {
             let query = interaction.options.getString('query', true);
             
@@ -66,14 +28,10 @@ export async function executeCommand(interaction: ChatInputCommandInteraction) {
             try {
                 const url = new URL(query);
                 if ((url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) && url.searchParams.get('list')?.startsWith('RD')) {
-                    url.searchParams.delete('list');
-                    url.searchParams.delete('start_radio');
-                    url.searchParams.delete('index');
+                    ['list', 'start_radio', 'index'].forEach(p => url.searchParams.delete(p));
                     query = url.toString();
                 }
-            } catch (e) {
-                // 如果是純文字搜尋而不是網址，就略過不處理
-            }
+            } catch {}
 
             const searchMessage = await interaction.followUp(`🔍 正在搜尋並載入 **${query}**... 請稍候！`);
 
@@ -81,8 +39,7 @@ export async function executeCommand(interaction: ChatInputCommandInteraction) {
                 // Distube play
                 await distube.play(voiceChannel, query, {
                     member: member,
-                    textChannel: interaction.channel as any,
-                    interaction
+                    textChannel: interaction.channel as any
                 });
                 // Delete the "please wait" message once distube finishes adding
                 await searchMessage.delete().catch(() => {});
@@ -102,16 +59,29 @@ export async function executeCommand(interaction: ChatInputCommandInteraction) {
         }
 
         if (!queue) {
+            if (interaction.commandName === 'stop') {
+                const voice = distube.voices.get(interaction.guildId!);
+                if (voice) {
+                    clearIdleTimer(interaction.guildId!);
+                    distube.voices.leave(interaction.guildId!);
+                    return interaction.followUp('⏹️ 已退出語音頻道！');
+                }
+            }
             return interaction.followUp('There is no music playing right now!');
         }
 
         if (interaction.commandName === 'skip') {
             if (queue.songs.length === 1 && !queue.autoplay) {
                 await queue.stop();
-                return interaction.followUp('Skipped the last song. Queue is now empty.');
+                resetIdleTimer(interaction.guildId!, interaction.channel);
+                return interaction.followUp('⏹️ 已跳過最後一首歌曲，播放清單已空。');
             } else {
+                const nextSong = queue.songs[1];
                 await queue.skip();
-                return interaction.followUp('Skipped the current song!');
+                if (nextSong) {
+                    return interaction.followUp(`⏭️ 已跳過當前歌曲！即將播放：**${nextSong.name}**`);
+                }
+                return interaction.followUp('⏭️ 已跳過當前歌曲！');
             }
         }
 
@@ -133,7 +103,30 @@ export async function executeCommand(interaction: ChatInputCommandInteraction) {
 
         if (interaction.commandName === 'stop') {
             await queue.stop();
-            return interaction.followUp('Stopped the music and cleared the queue!');
+            clearIdleTimer(interaction.guildId!);
+            distube.voices.leave(interaction.guildId!);
+            return interaction.followUp('⏹️ 已停止播放音樂並退出語音頻道！');
+        }
+
+        if (interaction.commandName === 'shuffle') {
+            if (queue.songs.length <= 1) {
+                return interaction.followUp('⚠️ 播放清單中沒有待播的歌曲可供隨機打亂！');
+            }
+            if (queue.songs.length === 2) {
+                return interaction.followUp('ℹ️ 播放清單中目前只有 1 首待播歌曲，無須打亂順序。');
+            }
+
+            await queue.shuffle();
+            prefetchNextSong(queue);
+
+            const upcoming = queue.songs.slice(1, 6);
+            let previewText = `🔀 **已成功隨機打亂播放清單！**（共 ${queue.songs.length - 1} 首待播歌曲）\n\n**接下來即將播放：**\n`;
+            previewText += upcoming.map((s: any, idx: number) => `${idx + 1}. **${s.name}** - \`${s.formattedDuration}\``).join('\n');
+            if (queue.songs.length > 6) {
+                previewText += `\n...以及其他 ${queue.songs.length - 6} 首歌曲`;
+            }
+
+            return interaction.followUp(previewText);
         }
 
         if (interaction.commandName === 'volume') {
@@ -148,7 +141,7 @@ export async function executeCommand(interaction: ChatInputCommandInteraction) {
             
             const nextSongs = queue.songs.slice(1, 10);
             if (nextSongs.length > 0) {
-                queueString += nextSongs.map((song, i) => `${i + 1}. ${song.name} - \`${song.formattedDuration}\``).join('\n');
+                queueString += nextSongs.map((song: any, i: number) => `${i + 1}. ${song.name} - \`${song.formattedDuration}\``).join('\n');
             } else {
                 queueString += 'No more songs in the queue.';
             }
