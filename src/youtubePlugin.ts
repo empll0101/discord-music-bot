@@ -55,8 +55,12 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
     private getJsRuntimeArgs(): string[] {
         const homeDir = process.env.HOME || process.env.USERPROFILE || '';
         const winDeno = path.join(homeDir, '.deno', 'bin', 'deno.exe');
+        const winProgramFiles = 'C:\\Program Files\\Deno\\deno.exe';
         const linuxDeno = path.join(homeDir, '.deno', 'bin', 'deno');
 
+        if (fs.existsSync(winProgramFiles)) {
+            return ['--js-runtimes', `deno:${winProgramFiles}`];
+        }
         if (fs.existsSync(winDeno)) {
             return ['--js-runtimes', `deno:${winDeno}`];
         }
@@ -75,6 +79,8 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                 req.socket.setNoDelay(true);
                 const u = new URL(req.url || '/', `http://127.0.0.1:${this.port}`);
                 const query = u.searchParams.get('q');
+                const titleParam = u.searchParams.get('title');
+                const uploaderParam = u.searchParams.get('uploader');
                 if (!query) {
                     res.writeHead(400);
                     res.end('Missing query parameter');
@@ -94,8 +100,16 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
                 let retriedWithoutCookies = false;
                 let retriedWithCookies = false;
+                let fallbackAttempted = false;
+                let currentYtdlp: any = null;
 
-                const startDownload = (useCookies = Boolean(this.cookiesPath)) => {
+                req.on('close', () => {
+                    if (currentYtdlp && !currentYtdlp.killed) {
+                        currentYtdlp.kill();
+                    }
+                });
+
+                const startDownload = (targetUrl: string, useCookies = Boolean(this.cookiesPath)) => {
                     const args = [
                         ...this.getJsRuntimeArgs(),
                         '--remote-components', 'ejs:github',
@@ -118,12 +132,13 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     if (useCookies && this.cookiesPath) {
                         args.push('--cookies', this.cookiesPath);
                     }
-                    args.push(query);
+                    args.push(targetUrl);
 
-                    console.log(`[YouTubePlugin] Spawning yt-dlp stream for: ${query} (cookies: ${useCookies})`);
+                    console.log(`[YouTubePlugin] Spawning yt-dlp stream for: ${targetUrl} (cookies: ${useCookies})`);
                     const ytdlp = spawn('yt-dlp', args, {
                         stdio: ['ignore', 'pipe', 'pipe']
                     });
+                    currentYtdlp = ytdlp;
                     
                     const chunks: Buffer[] = [];
                     let totalBytes = 0;
@@ -179,18 +194,59 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
                         if (code !== 0 && code !== null) {
                             console.error(`[YouTubePlugin] yt-dlp stream failed with code ${code}: ${stderrMsg.trim()}`);
-                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies) {
+                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies && !stderrMsg.includes('Video unavailable') && !stderrMsg.includes('This video is not available')) {
                                 retriedWithoutCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream failed with cookies, retrying without cookies...');
-                                startDownload(false);
+                                startDownload(targetUrl, false);
                                 return;
                             }
                             if (!headersSent && !useCookies && this.cookiesPath && !retriedWithCookies && (stderrMsg.includes('Sign in') || stderrMsg.includes('confirm your age'))) {
                                 retriedWithCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream requires cookies, retrying with cookies...');
-                                startDownload(true);
+                                startDownload(targetUrl, true);
                                 return;
                             }
+
+                            // If video is unavailable in stream (e.g. Topic track in a playlist on datacenter IP),
+                            // fallback to searching for the playable alternative song
+                            if (!headersSent && !fallbackAttempted && (stderrMsg.includes('Video unavailable') || stderrMsg.includes('This video is not available'))) {
+                                fallbackAttempted = true;
+                                console.warn(`⚠️ [YouTubePlugin StreamServer] Stream failed for ${targetUrl} due to availability. Attempting fallback...`);
+                                (async () => {
+                                    try {
+                                        let searchQuery = '';
+                                        if (titleParam) {
+                                            const cleanUploader = (uploaderParam || '').replace(/- Topic$/i, '').trim();
+                                            searchQuery = `${titleParam} ${cleanUploader}`.trim();
+                                        } else {
+                                            const info = await this.fetchOEmbed(targetUrl);
+                                            if (info && info.title) {
+                                                const cleanAuthor = info.author_name.replace(/- Topic$/i, '').trim();
+                                                searchQuery = `${info.title} ${cleanAuthor}`.trim();
+                                            }
+                                        }
+
+                                        if (searchQuery) {
+                                            console.log(`[YouTubePlugin StreamServer] 🔄 Fallback searching YouTube for: "${searchQuery}"`);
+                                            const targetId = this.extractVideoId(targetUrl);
+                                            const fallbackSong = await this.searchSong(searchQuery, {}, targetId);
+                                            const fallbackId = fallbackSong?.url ? this.extractVideoId(fallbackSong.url) : (fallbackSong?.id || '');
+                                            if (fallbackSong && fallbackSong.url && (!targetId || fallbackId !== targetId)) {
+                                                console.log(`✅ [YouTubePlugin StreamServer] Streaming fallback song instead: ${fallbackSong.name} (${fallbackSong.url})`);
+                                                startDownload(fallbackSong.url, Boolean(this.cookiesPath));
+                                                return;
+                                            }
+                                        }
+                                    } catch (fallbackErr) {
+                                        console.error('[YouTubePlugin StreamServer] Fallback search error:', fallbackErr);
+                                    }
+                                    if (!res.destroyed) {
+                                        res.destroy(new Error(`yt-dlp stream exited with code ${code}`));
+                                    }
+                                })();
+                                return;
+                            }
+
                             if (!res.destroyed) {
                                 res.destroy(new Error(`yt-dlp stream exited with code ${code}`));
                             }
@@ -208,16 +264,10 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                             res.end();
                         }
                     });
-
-                    req.on('close', () => {
-                        if (!ytdlp.killed) {
-                            ytdlp.kill();
-                        }
-                    });
                 };
 
                 // Start with cookies if available to satisfy bot check on datacenter IP
-                startDownload(Boolean(this.cookiesPath));
+                startDownload(query, Boolean(this.cookiesPath));
             } catch (e) {
                 console.error('[YouTubePlugin StreamServer] Request error:', e);
                 if (!res.headersSent) {
@@ -387,6 +437,11 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         });
     }
 
+    extractVideoId(url: string): string {
+        const match = url.match(/(?:v=|\/|youtu\.be\/)([a-zA-Z0-9_-]{11})(?:[&?]|$)/);
+        return match ? match[1] : '';
+    }
+
     async resolve(url: string, options: any): Promise<any> {
         let data: any;
         try {
@@ -402,7 +457,8 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     const cleanAuthor = info.author_name.replace(/- Topic$/i, '').trim();
                     const searchQuery = `${info.title} ${cleanAuthor}`.trim();
                     console.log(`[YouTubePlugin] 🔄 Fallback searching YouTube for: "${searchQuery}"`);
-                    const fallbackSong = await this.searchSong(searchQuery, options);
+                    const targetId = this.extractVideoId(url);
+                    const fallbackSong = await this.searchSong(searchQuery, options, targetId);
                     if (fallbackSong) {
                         console.log(`✅ [YouTubePlugin] Fallback successfully found playable song: ${fallbackSong.name} (${fallbackSong.url})`);
                         return fallbackSong;
@@ -454,9 +510,11 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         }, options);
     }
 
-    async searchSong(query: string, options: any): Promise<any> {
-        const data = await this.runYtDlpJson([`ytsearch1:${query}`]);
-        const entry = data.entries ? data.entries[0] : data;
+    async searchSong(query: string, options: any, excludeId?: string): Promise<any> {
+        const count = excludeId ? 3 : 1;
+        const data = await this.runYtDlpJson([`ytsearch${count}:${query}`]);
+        const entries = data.entries ? data.entries : (data ? [data] : []);
+        const entry = entries.find((e: any) => !excludeId || e.id !== excludeId) || entries[0];
         if (!entry) return null;
 
         return new SongClass({
@@ -484,7 +542,14 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         if (!target) {
             throw new Error('Cannot get stream URL: Song has no valid URL or ID');
         }
-        return `http://127.0.0.1:${this.port}/stream?q=${encodeURIComponent(target)}`;
+        let streamUrl = `http://127.0.0.1:${this.port}/stream?q=${encodeURIComponent(target)}`;
+        if (song.name) {
+            streamUrl += `&title=${encodeURIComponent(song.name)}`;
+        }
+        if (song.uploader?.name) {
+            streamUrl += `&uploader=${encodeURIComponent(song.uploader.name)}`;
+        }
+        return streamUrl;
     }
 
     async getRelatedSongs(song: any): Promise<any[]> {
