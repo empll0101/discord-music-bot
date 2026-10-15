@@ -95,12 +95,12 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                 let retriedWithoutCookies = false;
                 let retriedWithCookies = false;
 
-                const startDownload = (useCookies = Boolean(this.cookiesPath)) => {
+                const startDownload = (useCookies = false) => {
                     const args = [
                         ...this.getJsRuntimeArgs(),
                         '--remote-components', 'ejs:github',
                         '--no-cache-dir',
-                        '--extractor-args', 'youtube:player_client=android,web,tv',
+                        '--extractor-args', 'youtube:player_client=web_embedded,android',
                         '-f', 'ba/b',
                         '--no-playlist',
                         '--no-warnings',
@@ -186,9 +186,9 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                                 startDownload(false);
                                 return;
                             }
-                            if (!headersSent && !useCookies && this.cookiesPath && !retriedWithCookies) {
+                            if (!headersSent && !useCookies && this.cookiesPath && !retriedWithCookies && (stderrMsg.includes('Sign in') || stderrMsg.includes('confirm your age'))) {
                                 retriedWithCookies = true;
-                                console.warn('⚠️ [YouTubePlugin] Stream failed without cookies, retrying with cookies...');
+                                console.warn('⚠️ [YouTubePlugin] Stream requires cookies, retrying with cookies...');
                                 startDownload(true);
                                 return;
                             }
@@ -217,8 +217,8 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     });
                 };
 
-                // On datacenter IP, start with cookies if available to satisfy bot verification
-                startDownload(Boolean(this.cookiesPath));
+                // Default to web_embedded player without cookies for best stability
+                startDownload(false);
             } catch (e) {
                 console.error('[YouTubePlugin StreamServer] Request error:', e);
                 if (!res.headersSent) {
@@ -256,7 +256,7 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         }
     }
 
-    private async runYtDlpJson(args: string[], useCookies = Boolean(this.cookiesPath)): Promise<any> {
+    private async runYtDlpJson(args: string[], useCookies = false): Promise<any> {
         // Cache lookup
         const cacheKey = `${args.join(' ')}|cookies=${useCookies}`;
         const cached = this.metaCache.get(cacheKey);
@@ -268,7 +268,7 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
             ...this.getJsRuntimeArgs(),
             '--remote-components', 'ejs:github',
             '--no-cache-dir',
-            '--extractor-args', 'youtube:player_client=android,web,tv',
+            '--extractor-args', 'youtube:player_client=web_embedded,android',
             '--dump-single-json',
             '--flat-playlist',
             '--retries', '2',
@@ -318,21 +318,20 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                         reject(new Error(`Failed to parse yt-dlp JSON: ${e}`));
                     }
                 } else {
-                    // Smart retry: switch cookie mode if sign-in or challenge is triggered
-                    if (useCookies && this.cookiesPath && (stderr.includes('Sign in') || stderr.includes('confirm your age'))) {
-                        console.warn('⚠️ [YouTubePlugin] Query with cookies failed, retrying without cookies...');
+                    if (!useCookies && this.cookiesPath && (stderr.includes('Sign in') || stderr.includes('confirm your age') || stderr.includes('Private video'))) {
+                        console.warn('⚠️ [YouTubePlugin] Query without cookies failed, retrying with cookies...');
                         try {
-                            const result = await this.runYtDlpJson(args, false);
+                            const result = await this.runYtDlpJson(args, true);
                             resolve(result);
                             return;
                         } catch (retryErr) {
                             reject(retryErr);
                             return;
                         }
-                    } else if (!useCookies && this.cookiesPath && (stderr.includes('Sign in') || stderr.includes('confirm your age') || stderr.includes('Private video'))) {
-                        console.warn('⚠️ [YouTubePlugin] Query without cookies failed, retrying with cookies...');
+                    } else if (useCookies && (stderr.includes('Sign in') || stderr.includes('The page needs to be reloaded'))) {
+                        console.warn('⚠️ [YouTubePlugin] Query with cookies failed, retrying without cookies...');
                         try {
-                            const result = await this.runYtDlpJson(args, true);
+                            const result = await this.runYtDlpJson(args, false);
                             resolve(result);
                             return;
                         } catch (retryErr) {
