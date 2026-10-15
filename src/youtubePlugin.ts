@@ -95,12 +95,11 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                 let retriedWithoutCookies = false;
                 let retriedWithCookies = false;
 
-                const startDownload = (useCookies = false) => {
+                const startDownload = (useCookies = Boolean(this.cookiesPath)) => {
                     const args = [
                         ...this.getJsRuntimeArgs(),
                         '--remote-components', 'ejs:github',
                         '--no-cache-dir',
-                        '--extractor-args', 'youtube:player_client=web_embedded,android',
                         '-f', 'ba/b',
                         '--no-playlist',
                         '--no-warnings',
@@ -217,8 +216,8 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                     });
                 };
 
-                // Default to web_embedded player without cookies for best stability
-                startDownload(false);
+                // Start with cookies if available to satisfy bot check on datacenter IP
+                startDownload(Boolean(this.cookiesPath));
             } catch (e) {
                 console.error('[YouTubePlugin StreamServer] Request error:', e);
                 if (!res.headersSent) {
@@ -256,7 +255,7 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         }
     }
 
-    private async runYtDlpJson(args: string[], useCookies = false): Promise<any> {
+    private async runYtDlpJson(args: string[], useCookies = Boolean(this.cookiesPath)): Promise<any> {
         // Cache lookup
         const cacheKey = `${args.join(' ')}|cookies=${useCookies}`;
         const cached = this.metaCache.get(cacheKey);
@@ -268,7 +267,6 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
             ...this.getJsRuntimeArgs(),
             '--remote-components', 'ejs:github',
             '--no-cache-dir',
-            '--extractor-args', 'youtube:player_client=web_embedded,android',
             '--dump-single-json',
             '--flat-playlist',
             '--retries', '2',
