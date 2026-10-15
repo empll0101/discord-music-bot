@@ -73,6 +73,10 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         return ['--js-runtimes', 'deno'];
     }
 
+    private isUnavailableError(msg: string): boolean {
+        return /unavailable|not available|Premium members|members-only|private video|blocked|restricted|403/i.test(msg);
+    }
+
     private initServer() {
         this.server = http.createServer((req, res) => {
             try {
@@ -194,7 +198,9 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
 
                         if (code !== 0 && code !== null) {
                             console.error(`[YouTubePlugin] yt-dlp stream failed with code ${code}: ${stderrMsg.trim()}`);
-                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies && !stderrMsg.includes('Video unavailable') && !stderrMsg.includes('This video is not available')) {
+                            const unavailable = this.isUnavailableError(stderrMsg);
+
+                            if (!headersSent && useCookies && this.cookiesPath && !retriedWithoutCookies && !unavailable) {
                                 retriedWithoutCookies = true;
                                 console.warn('⚠️ [YouTubePlugin] Stream failed with cookies, retrying without cookies...');
                                 startDownload(targetUrl, false);
@@ -207,9 +213,9 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                                 return;
                             }
 
-                            // If video is unavailable in stream (e.g. Topic track in a playlist on datacenter IP),
+                            // If video is unavailable in stream (e.g. Topic track, Music Premium only, or blocked on datacenter IP),
                             // fallback to searching for the playable alternative song
-                            if (!headersSent && !fallbackAttempted && (stderrMsg.includes('Video unavailable') || stderrMsg.includes('This video is not available'))) {
+                            if (!headersSent && !fallbackAttempted && unavailable) {
                                 fallbackAttempted = true;
                                 console.warn(`⚠️ [YouTubePlugin StreamServer] Stream failed for ${targetUrl} due to availability. Attempting fallback...`);
                                 (async () => {
@@ -448,9 +454,9 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
             data = await this.runYtDlpJson([url]);
         } catch (err: any) {
             const errStr = String(err?.message || err);
-            // Smart fallback: If YouTube blocks this specific video ID (common with DRM Music Topic tracks on datacenter IPs),
+            // Smart fallback: If YouTube blocks this specific video ID (common with DRM Music Topic tracks or Music Premium on datacenter IPs),
             // fetch title via YouTube's public oEmbed API and search for a playable alternative.
-            if (errStr.includes('Video unavailable') || errStr.includes('This video is not available') || errStr.includes('403')) {
+            if (this.isUnavailableError(errStr)) {
                 console.warn(`⚠️ [YouTubePlugin] Direct resolve failed for ${url} (${errStr.split('\n')[0]}). Attempting oEmbed title fallback...`);
                 const info = await this.fetchOEmbed(url);
                 if (info && info.title) {
