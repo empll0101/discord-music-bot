@@ -85,11 +85,10 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
                 let retriedWithoutCookies = false;
                 let retriedWithCookies = false;
 
-                const startDownload = (useCookies = false) => {
+                const startDownload = (useCookies = Boolean(this.cookiesPath)) => {
                     const args = [
                         ...this.getDenoArgs(),
                         '--remote-components', 'ejs:github',
-                        '--extractor-args', 'youtube:player_client=web_embedded,android',
                         '-f', 'ba/b',
                         '--no-playlist',
                         '--no-warnings',
@@ -243,11 +242,10 @@ export class YouTubePlugin extends (ExtractorPluginClass as { new(): any }) {
         }
     }
 
-    private async runYtDlpJson(args: string[], useCookies = false): Promise<any> {
+    private async runYtDlpJson(args: string[], useCookies = Boolean(this.cookiesPath)): Promise<any> {
         const fullArgs = [
             ...this.getDenoArgs(),
             '--remote-components', 'ejs:github',
-            '--extractor-args', 'youtube:player_client=web_embedded,android',
             '--dump-single-json',
             '--flat-playlist',
             '--retries', '3',
